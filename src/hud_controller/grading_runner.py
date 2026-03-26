@@ -11,6 +11,7 @@ This script:
 
 import logging
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -49,6 +50,18 @@ class GradingRunner:
         self.grade_working_dir = "/tmp/grading_workspace_" + str(uuid.uuid4())
         self.test_files = test_files
 
+    @staticmethod
+    def _cocotb_pass_fraction_from_output(stdout: str, stderr: str) -> float | None:
+        """Parse cocotb summary like 'Failed 3 of 4 tests' → pass fraction (here 0.25). Returns None if not found."""
+        text = f"{stdout}\n{stderr}"
+        m = re.search(r"Failed\s+(\d+)\s+of\s+(\d+)\s+tests", text, re.IGNORECASE)
+        if not m:
+            return None
+        failed, total = int(m.group(1)), int(m.group(2))
+        if total <= 0:
+            return None
+        return (total - failed) / total
+
     def _format_junit_xml(self, test_name: str, failure_message: str | None = None, stdout: str = "", stderr: str = "") -> str:
         return f"""<?xml version="1.0" encoding="UTF-8"?>
 <testsuites>
@@ -61,7 +74,7 @@ class GradingRunner:
   </testsuite>
 </testsuites>"""
 
-    def run_tests(self) -> tuple[bool, str]:
+    def run_tests(self) -> tuple[bool, dict]:
         logger.info(f"Running tests in {self.grade_working_dir}")
         
         result = subprocess.run(
@@ -82,10 +95,35 @@ class GradingRunner:
         #     return f.read()
 
         # make a single junit xml file with the test results
-        if result.returncode != 0:
-            return False, {"junit": self._format_junit_xml("Tests", "Tests failed", result.stdout, result.stderr)}
-        else:
-            return True, {"junit": self._format_junit_xml("Tests", None, result.stdout, result.stderr)}
+        if result.returncode == 0:
+            return True, {
+                "junit": self._format_junit_xml("Tests", None, result.stdout, result.stderr),
+                "test_score": 1.0,
+            }
+
+        frac = self._cocotb_pass_fraction_from_output(result.stdout, result.stderr)
+        if frac is not None:
+            # Binary grade: reward (and HUD Success%) is nonzero only if every cocotb test passes.
+            full_pass = frac >= 1.0 - 1e-9
+            msg = (
+                None
+                if full_pass
+                else f"Cocotb incomplete: {frac:.2%} passed; require 100% for nonzero score"
+            )
+            logger.info(
+                "Cocotb summary: %.2f%% passed; full_pass=%s (binary grading)",
+                frac * 100,
+                full_pass,
+            )
+            return full_pass, {
+                "junit": self._format_junit_xml("Tests", msg, result.stdout, result.stderr),
+                "test_score": 1.0 if full_pass else 0.0,
+            }
+
+        return False, {
+            "junit": self._format_junit_xml("Tests", "Tests failed", result.stdout, result.stderr),
+            "test_score": 0.0,
+        }
 
 
     def _get_build_command(self) -> list[str]:
