@@ -8,7 +8,7 @@ from mcp.types import ImageContent, TextContent  # type: ignore
 from pydantic import Field
 
 import hud_controller.problems
-from hud_controller.grading_runner import GradingRunner
+from hud_controller.grading_runner import PASS_THRESHOLD, GradingRunner
 from hud_controller.utils import import_submodules
 
 from .setup import start_dinit
@@ -145,10 +145,7 @@ import_submodules(hud_controller.problems)
 template = """
 You will be working on a task for example-verilog-codebase.
 The repository has already been cloned in the environment in /home/ubuntu/example-verilog-codebase.
-Iverilog and Verilator have been installed.
 Do not change any of the input or output ports of the modules.
-
-You should write verilog testbenches to test your code and ensure it matches the functional specification (in addition to syntactic correctness).
 
 Use the tools provided to complete the following task:
 
@@ -222,13 +219,21 @@ async def grade_problem(
 
     success, result = runner.run_grading()
 
-    if success:
+    test_score = float(result.get("test_score", 1.0 if success else 0.0))
+    pass_threshold = float(result.get("pass_threshold", PASS_THRESHOLD))
+    # Any score below threshold is treated as 0% for the grade.
+    if test_score < pass_threshold:
+        test_score = 0.0
+        success = False
+        result = {**result, "test_score": 0.0, "pass_threshold": pass_threshold}
+
+    if success and test_score >= pass_threshold:
         logger.info("Grading successful!")
     else:
-        logger.error("Grading failed!")
+        logger.error("Grading failed or partial!")
 
     grade = Grade(
-        subscores={"Tests": 1.0 if success else 0.0},
+        subscores={"Tests": test_score},
         weights={"Tests": 1.0},
         metadata=result,
     )

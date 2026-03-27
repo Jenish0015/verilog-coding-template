@@ -28,6 +28,8 @@ dev = ["pytest>=7.0.0", "ruff>=0.11.2", "pre-commit>=3.5.0"]
 
 [project.scripts]
 hud_eval = "hud_controller.app:main"
+# Same as `hud` CLI but patches grouped eval so "Mean pass%" = mean cocotb pass fraction (not reward>0 count).
+hud-patched = "hud_controller.hud_cli_entry:main"
 setup_problem = "hud_controller.app:setup_problem_script"
 grade_problem = "hud_controller.app:grade_problem_script"
 validate_problem = "hud_controller.app:validate_problem_script"

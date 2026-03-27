@@ -14,13 +14,48 @@ import os
 import re
 import subprocess
 import sys
-import threading
 import uuid
 from pathlib import Path
 
 from .utils import merge_junits
 
 logger = logging.getLogger(__name__)
+PASS_THRESHOLD = 0.85
+
+
+def _ubuntu_subprocess_env() -> dict[str, str]:
+    """Environment for `sudo -u ubuntu` subprocesses: valid TERM avoids pytest 'unknown terminal' noise."""
+    term = os.environ.get("TERM", "") or "linux"
+    if term.lower() in ("unknown", "dumb"):
+        term = "linux"
+    return dict(os.environ, HOME="/home/ubuntu", TERM=term)
+
+
+def _pytest_timeout_seconds() -> float | None:
+    """Optional wall-clock limit for pytest (cocotb). Unset or invalid = no limit (unchanged grading behavior)."""
+    raw = os.environ.get("GRADING_PYTEST_TIMEOUT", "").strip()
+    if not raw:
+        return None
+    try:
+        v = float(raw)
+        return v if v > 0 else None
+    except ValueError:
+        return None
+
+
+def _log_pytest_stderr(stderr: str, returncode: int) -> None:
+    if not (stderr or "").strip():
+        return
+    low = stderr.lower()
+    benign = (
+        "terminal type" in low
+        and ("unknown" in low or "dumb" in low or "no entry" in low)
+    )
+    if benign and returncode == 0:
+        logger.debug("Test stderr (benign): %s", stderr)
+        return
+    logger.info("Test stderr: %s", stderr)
+
 
 class GradingRunner:
     """Handles the grading workflow for agent patch testing."""
@@ -76,17 +111,32 @@ class GradingRunner:
 
     def run_tests(self) -> tuple[bool, dict]:
         logger.info(f"Running tests in {self.grade_working_dir}")
-        
-        result = subprocess.run(
-            ["sudo", "-u", "ubuntu", "bash", "-lc", " ".join(self._get_test_command())],
-            cwd=Path(self.grade_working_dir),
-            capture_output=True,
-            text=True,
-        )
-        
+        timeout_s = _pytest_timeout_seconds()
+        try:
+            result = subprocess.run(
+                ["sudo", "-u", "ubuntu", "bash", "-lc", " ".join(self._get_test_command())],
+                cwd=Path(self.grade_working_dir),
+                capture_output=True,
+                text=True,
+                env=_ubuntu_subprocess_env(),
+                timeout=timeout_s,
+            )
+        except subprocess.TimeoutExpired as e:
+            logger.error("Pytest timed out after %s s", timeout_s)
+            out, err = e.stdout or "", e.stderr or ""
+            return False, {
+                "junit": self._format_junit_xml(
+                    "Tests",
+                    f"Pytest timed out after {timeout_s}s",
+                    out,
+                    err,
+                ),
+                "test_score": 0.0,
+            }
+
         logger.info(f"Tests completed with code: {result.returncode}")
         logger.info(f"Test output: {result.stdout}")
-        logger.info(f"Test error: {result.stderr}")
+        _log_pytest_stderr(result.stderr, result.returncode)
         
         # # [CUSTOMIZE] Set your test results XML file path
         # xml_file = "[TEST_RESULTS_XML_FILE]"
@@ -103,21 +153,40 @@ class GradingRunner:
 
         frac = self._cocotb_pass_fraction_from_output(result.stdout, result.stderr)
         if frac is not None:
-            # Binary grade: reward (and HUD Success%) is nonzero only if every cocotb test passes.
-            full_pass = frac >= 1.0 - 1e-9
+            # Below threshold: no credit (0% score). At/above: reward = cocotb pass fraction.
+            if frac < PASS_THRESHOLD:
+                logger.info(
+                    "Cocotb pass fraction %.4f below PASS_THRESHOLD %.2f; test_score set to 0",
+                    frac,
+                    PASS_THRESHOLD,
+                )
+                return False, {
+                    "junit": self._format_junit_xml(
+                        "Tests",
+                        f"Cocotb pass fraction {frac:.2%} is below {PASS_THRESHOLD:.0%}; graded as 0%",
+                        result.stdout,
+                        result.stderr,
+                    ),
+                    "test_score": 0.0,
+                    "pass_threshold": PASS_THRESHOLD,
+                    "cocotb_pass_fraction": float(frac),
+                }
+
+            passed = True
             msg = (
                 None
-                if full_pass
-                else f"Cocotb incomplete: {frac:.2%} passed; require 100% for nonzero score"
+                if frac >= 1.0 - 1e-9
+                else f"Cocotb partial result: {frac:.2%} of cocotb checks passed (>= {PASS_THRESHOLD:.0%} threshold)"
             )
             logger.info(
-                "Cocotb summary: %.2f%% passed; full_pass=%s (binary grading)",
+                "Cocotb summary: %.2f%% passed; passed_threshold=%s",
                 frac * 100,
-                full_pass,
+                passed,
             )
-            return full_pass, {
+            return passed, {
                 "junit": self._format_junit_xml("Tests", msg, result.stdout, result.stderr),
-                "test_score": 1.0 if full_pass else 0.0,
+                "test_score": float(frac),
+                "pass_threshold": PASS_THRESHOLD,
             }
 
         return False, {
@@ -141,9 +210,15 @@ class GradingRunner:
         subprocess.run(["sudo", "-u", "ubuntu", "cp", "-r", self.original_repo_path, self.grade_working_dir], check=True)
         logger.info(f"Copied original repo to {self.grade_working_dir}")
 
-        # step 1.5 get the agent patch
+        # step 1.5 get the agent patch (must run in the live repo the agent edited)
         logger.info("Getting agent patch")
-        patch = subprocess.run(["sudo", "-u", "ubuntu", "git", "diff"], capture_output=True, text=True).stdout
+        patch = subprocess.run(
+            ["sudo", "-u", "ubuntu", "git", "diff"],
+            cwd=self.original_repo_path,
+            capture_output=True,
+            text=True,
+            env=_ubuntu_subprocess_env(),
+        ).stdout
 
         # Step 2: apply test patch
         logger.info(f"Applying test patch to {self.grade_working_dir}")
@@ -153,51 +228,33 @@ class GradingRunner:
 
         # Step 3: compile the project (should work if the agent code compiles)
         logger.info(f"Compiling project in {self.grade_working_dir}")
-        
-        # Run build and stream output to stderr in real-time
-        build_process = subprocess.Popen(
+        build_result = subprocess.run(
             ["sudo", "-u", "ubuntu", "bash", "-lc", " ".join(self._get_build_command())],
             cwd=self.grade_working_dir,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            capture_output=True,
             text=True,
+            env=_ubuntu_subprocess_env(),
         )
-        
-        # Collect output for error reporting while streaming
-        build_output = []
-        
-        def stream_build_stdout():
-            """Stream stdout to stderr while collecting for error reporting."""
-            for line in build_process.stdout:
-                sys.stderr.write(line)
-                sys.stderr.flush()
-                build_output.append(line)
-        
-        def stream_build_stderr():
-            """Stream stderr to stderr while collecting for error reporting."""
-            for line in build_process.stderr:
-                sys.stderr.write(line)
-                sys.stderr.flush()
-                build_output.append(line)
-        
-        # Start streaming threads
-        stdout_thread = threading.Thread(target=stream_build_stdout)
-        stderr_thread = threading.Thread(target=stream_build_stderr)
-        
-        stdout_thread.start()
-        stderr_thread.start()
-        
-        # Wait for threads to complete
-        stdout_thread.join()
-        stderr_thread.join()
-        
-        # Wait for the process to complete
-        build_result_code = build_process.wait()
-        
+        build_output: list[str] = []
+        if build_result.stdout:
+            sys.stderr.write(build_result.stdout)
+            sys.stderr.flush()
+            build_output.append(build_result.stdout)
+        if build_result.stderr:
+            sys.stderr.write(build_result.stderr)
+            sys.stderr.flush()
+            build_output.append(build_result.stderr)
+        build_result_code = build_result.returncode
+
         # Check exit code
         if build_result_code != 0:
             # Format compile error as JUnit XML
-            xml_content = self._format_junit_xml("AgentPatchCompiles", "Agent patch compilation failed", "".join(build_output), "")
+            xml_content = self._format_junit_xml(
+                "AgentPatchCompiles",
+                "Agent patch compilation failed",
+                "".join(build_output),
+                "",
+            )
             logger.info(f"Compilation failed with exit code {build_result_code}")
             return False, {"junit": xml_content, "agent_patch": patch}
         
@@ -234,13 +291,13 @@ class GradingRunner:
                 check=True,
                 capture_output=True,
                 text=True,
-                env=dict(os.environ, HOME="/home/ubuntu"),
+                env=_ubuntu_subprocess_env(),
             )
             logger.info("Baseline compilation successful")
         except subprocess.CalledProcessError as e:
             # Format compile error as JUnit XML
             xml_content = self._format_junit_xml("BaselineCompiles", "Baseline compilation failed", e.stdout, e.stderr)
-            logger.info("Baseline compilation failed, returning XML: {xml_content}")
+            logger.info(f"Baseline compilation failed, returning XML: {xml_content}")
             return False, {"junit": xml_content}
 
         # Step 3: Apply test patch
@@ -254,13 +311,26 @@ class GradingRunner:
 
         # Step 4: Ensure that the tests fail
         logger.info("Running tests with test patch (expecting failure)")
-        result = subprocess.run(
-            ["sudo", "-u", "ubuntu", "bash", "-lc", " ".join(self._get_test_command())],
-            cwd=self.grade_working_dir,
-            capture_output=True,
-            text=True,
-            env=dict(os.environ, HOME="/home/ubuntu"),
-        )
+        timeout_s = _pytest_timeout_seconds()
+        try:
+            result = subprocess.run(
+                ["sudo", "-u", "ubuntu", "bash", "-lc", " ".join(self._get_test_command())],
+                cwd=self.grade_working_dir,
+                capture_output=True,
+                text=True,
+                env=_ubuntu_subprocess_env(),
+                timeout=timeout_s,
+            )
+        except subprocess.TimeoutExpired as e:
+            out, err = e.stdout or "", e.stderr or ""
+            xml_content = self._format_junit_xml(
+                "TestPatchFailsTests",
+                f"Pytest timed out after {timeout_s}s while expecting tests to fail",
+                out,
+                err,
+            )
+            logger.info("Tests timed out with test patch, returning XML: %s", xml_content)
+            return False, {"junit": xml_content}
 
         if result.returncode == 0:
             # Tests passed when they should have failed (no failures in return code or XML)
@@ -281,7 +351,7 @@ class GradingRunner:
         logger.info("Reset repo to baseline successfully")
 
         # Step 6: Apply golden patch
-        logger.info("Applying golden patch from {self.golden_patch_path}")
+        logger.info(f"Applying golden patch from {self.golden_patch_path}")
         with open(self.golden_patch_path) as f:
             patch = f.read().encode("utf-8")
         subprocess.run(
@@ -308,7 +378,7 @@ class GradingRunner:
                 check=True,
                 capture_output=True,
                 text=True,
-                env=dict(os.environ, HOME="/home/ubuntu"),
+                env=_ubuntu_subprocess_env(),
             )
             logger.info("Compilation with golden patch successful")
         except subprocess.CalledProcessError as e:
@@ -319,13 +389,26 @@ class GradingRunner:
 
         # Step 9: Ensure that the tests pass with golden patch
         logger.info("Running tests with golden patch (expecting success)")
-        result = subprocess.run(
-            ["sudo", "-u", "ubuntu", "bash", "-lc", " ".join(self._get_test_command())],
-            cwd=self.grade_working_dir,
-            capture_output=True,
-            text=True,
-            env=dict(os.environ, HOME="/home/ubuntu"),
-        )
+        timeout_s = _pytest_timeout_seconds()
+        try:
+            result = subprocess.run(
+                ["sudo", "-u", "ubuntu", "bash", "-lc", " ".join(self._get_test_command())],
+                cwd=self.grade_working_dir,
+                capture_output=True,
+                text=True,
+                env=_ubuntu_subprocess_env(),
+                timeout=timeout_s,
+            )
+        except subprocess.TimeoutExpired as e:
+            out, err = e.stdout or "", e.stderr or ""
+            xml_content = self._format_junit_xml(
+                "GoldenPatchPassesTests",
+                f"Pytest timed out after {timeout_s}s (golden + test patch)",
+                out,
+                err,
+            )
+            logger.info("Tests timed out with golden patch, returning XML: %s", xml_content)
+            return False, {"junit": xml_content}
 
         if result.returncode != 0:
             # Tests failed when they should have passed

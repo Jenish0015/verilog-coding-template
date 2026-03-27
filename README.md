@@ -147,9 +147,9 @@ uv run utils/imagectl3.py verilog_ -bvj --jobs 4
 ```
 
 ### Run hud eval locally
-You can run the images locally with:
-```
-uv run hud local-hud.json claude --max-steps 50
+Generate task JSON first (`imagectl3` with `-j`), then run eval. Example:
+```bash
+uv run hud eval local-hud.json claude --max-steps 50
 ```
 
 ### Run hud eval remotely
@@ -160,8 +160,8 @@ Note that we also change the image prefix to make it pushable to docker hub.
 uv run utils/imagectl3.py govindhud/verilog_ -bvjp --jobs 4
 ```
 Once all images are pushed, we can:
-```
-uv run hud remote-hud.json claude --max-steps 50
+```bash
+uv run hud eval remote-hud.json claude --max-steps 50
 ```
 
 
@@ -171,19 +171,16 @@ uv run hud remote-hud.json claude --max-steps 50
 
 The framework clones a **target Verilog repository** that contains the problems to be solved. This is configured in two places:
 
-1. **Dockerfile (line ~109):** Specifies which repo to clone
-   ```dockerfile
-   RUN git clone https://github.com/hud-evals/example-verilog-codebase /home/ubuntu/example-codebase
-   ```
+1. **Dockerfile:** `ARG REPO_URL=...` and the clone into `/home/ubuntu/example-verilog-codebase` (see the `RUN git clone ... example-verilog-codebase` block).
 
-2. **grading_runner.py (line 46):** Path where the cloned repo lives
+2. **`grading_runner.py`:** Must match that clone path:
    ```python
-   self.original_repo_path = "/home/ubuntu/example-codebase"
+   self.original_repo_path = "/home/ubuntu/example-verilog-codebase"
    ```
 
-**Important:** When making changes to the remote repository, ALWAYS increment the `random` variable in the Dockerfile (line ~108) to force Docker to re-clone:
+**Important:** When making changes to the remote repository, ALWAYS increment the `random` variable in the Dockerfile to force Docker to re-clone:
 ```dockerfile
-ENV random=random6  # Increment this number!
+ENV random=random23  # Increment this number when you change the target repo or branches
 ```
 
 ### Environment Variables
@@ -194,6 +191,8 @@ Key environment variables used by the grading system:
 - `NODE_ENV` - Node environment (set to "test" for testing)
 - `PROBLEM_ID` - The specific problem being evaluated
 - `HINTS` - Hint level for the problem
+- `OTEL_SDK_DISABLED` - Set to `true` to disable HUD OpenTelemetry uploads when offline or when DNS to the telemetry host fails (see also `hud-patched` entrypoint, which defaults this when unset). Set to `false` to allow telemetry.
+- `GRADING_PYTEST_TIMEOUT` - Optional seconds (float) for pytest/cocotb in `grading_runner`. If unset, behavior matches the previous unlimited wait.
 
 ### Docker Configuration
 

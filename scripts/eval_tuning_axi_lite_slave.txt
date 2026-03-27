@@ -1,0 +1,7 @@
+Targeting ~30% success on axi_lite_slave when models score ~100% today:
+
+1) Tighten hidden tests in the GitHub repo (Jenish0015/axi_lite_slave): add edge cases, timing, or extra cocotb checks. Prompt-only changes cannot lower pass rate if the model always passes the full suite.
+
+2) Reduce agent budget: pass --max-steps 35 (or similar) to hud eval so runs often stop before a full fix.
+
+3) Grading now records a fractional score when cocotb reports "Failed X of Y tests" (partial cocotb passes). Mean reward can fall below 1.0 even before changing tests; Success% in HUD may still count only full passes depending on hud-python version.

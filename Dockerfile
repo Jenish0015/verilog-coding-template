@@ -41,7 +41,7 @@ RUN apt-get update -y \
   ffmpeg \
   nginx \
   gnupg \
-  gpg \ 
+  gpg \
   jq \
   build-essential \
   python3 \
@@ -99,8 +99,9 @@ RUN git config --global user.name "mr agent"
 # 0) Clone the problems repository
 # For private repos, pass GITHUB_TOKEN as build arg
 ARG GITHUB_TOKEN
-ARG REPO_URL=https://github.com/hud-evals/example-verilog-codebase.git
-ENV random=random6
+ARG REPO_URL=https://github.com/Jenish0015/axi_lite_slave
+ENV random=random23
+
 RUN cd /home/ubuntu && \
     if [ -n "$GITHUB_TOKEN" ]; then \
         git clone https://${GITHUB_TOKEN}@${REPO_URL#https://} example-verilog-codebase; \
@@ -166,6 +167,8 @@ COPY ./pyproject.toml /mcp_server/pyproject.toml
 COPY ./README.md /mcp_server/README.md
 
 ENV RUST_LOG=warn
+# Skip OpenTelemetry uploads when telemetry endpoint is unreachable (avoids noisy tracebacks).
+ENV OTEL_SDK_DISABLED=true
 RUN cd /mcp_server && uv venv && . .venv/bin/activate && uv sync && uv pip install -e . 
 ENV PYTHONPATH=/mcp_server/.venv/lib/python3.10/site-packages
 ENV PATH=/mcp_server/.venv/bin:$PATH

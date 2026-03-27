@@ -106,6 +106,12 @@ remote-openai-hud.json
 problems-metadata.json
 debug_codegen.py
 
+# Local clone for scripts/push_axi_lite_slave_repo.py
+_axi_lite_slave_work/
+
+# cocotb / Icarus sim build output
+sim_build/
+
 # Verification script
 test_setup.py
 
